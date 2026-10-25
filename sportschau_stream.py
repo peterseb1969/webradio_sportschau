@@ -122,9 +122,11 @@ def parse_iso(s: str | None) -> dt.datetime | None:
     # "+0000" -> "+00:00"
     s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
     try:
-        return dt.datetime.fromisoformat(s)
+        d = dt.datetime.fromisoformat(s)
     except ValueError:
         return None
+    # No offset given: the player config is UTC everywhere else.
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
 
 
 def parse_kickoff(synopsis: str) -> dt.datetime | None:
@@ -138,7 +140,10 @@ def parse_kickoff(synopsis: str) -> dt.datetime | None:
         tz = ZoneInfo("Europe/Berlin")
     except Exception:  # no tzdata: assume CEST
         tz = dt.timezone(dt.timedelta(hours=2))
-    return dt.datetime(y, mo, d, h, mi, tzinfo=tz)
+    try:
+        return dt.datetime(y, mo, d, h, mi, tzinfo=tz)
+    except ValueError:  # "31.02." or "24:00"
+        return None
 
 
 def extract_streams(raw_html: str, source_url: str = "") -> list[dict]:
@@ -152,30 +157,12 @@ def extract_streams(raw_html: str, source_url: str = "") -> list[dict]:
         mc = cfg.get("mc") if isinstance(cfg, dict) else None
         if not isinstance(mc, dict):
             continue
-        meta = mc.get("meta") or {}
-        urls = [m.get("url") for s in mc.get("streams") or []
-                for m in s.get("media") or [] if m.get("url")]
-        hls = next((u for u in urls if ".m3u8" in u), None)
-        mp3 = next((u for u in urls if "icecast" in u or ".mp3" in u), None)
-        if not (hls or mp3):
+        try:
+            rec = _stream_record(mc, source_url)
+        except (AttributeError, TypeError, ValueError):  # unexpected shape
             continue
-        slot_m = RE_SLOT.search(hls or mp3)
-        live = mc.get("live") or {}
-        page = ((mc.get("pluginData") or {}).get("sharing@web") or {}).get("link") or source_url
-        title = (meta.get("title") or "").removeprefix("Live hören: ").strip()
-        start = parse_iso(meta.get("broadcastedOnDateTime") or live.get("availFromDateTime"))
-        out.append({
-            "title": title,
-            "slot": slot_m.group(1) if slot_m else None,
-            "hls": hls,
-            "mp3": mp3,
-            "page": page,
-            "start": start.isoformat() if start else None,
-            "kickoff": (parse_kickoff(meta.get("synopsis") or "") or dt.datetime.min).isoformat()
-                       if parse_kickoff(meta.get("synopsis") or "") else None,
-            "dvr_seconds": live.get("dvrWindowSeconds"),
-            "geo_flag": mc.get("isGeoBlocked"),
-        })
+        if rec:
+            out.append(rec)
     # de-duplicate by page URL, keep first
     seen, uniq = set(), []
     for s in out:
@@ -184,6 +171,36 @@ def extract_streams(raw_html: str, source_url: str = "") -> list[dict]:
         seen.add(s["page"])
         uniq.append(s)
     return uniq
+
+
+def _stream_record(mc: dict, source_url: str) -> dict | None:
+    """One player config's `mc` -> stream record, or None if it has no stream."""
+    meta = mc.get("meta") or {}
+    urls = [m.get("url") for s in mc.get("streams") or []
+            for m in s.get("media") or [] if m.get("url")]
+    hls = next((u for u in urls if ".m3u8" in u), None)
+    mp3 = next((u for u in urls if "icecast" in u or ".mp3" in u), None)
+    if not (hls or mp3):
+        return None
+    slot_m = RE_SLOT.search(hls or mp3)
+    live = mc.get("live") or {}
+    page = ((mc.get("pluginData") or {}).get("sharing@web") or {}).get("link")
+    if not isinstance(page, str) or not page:  # it is the de-dup key
+        page = source_url
+    title = (meta.get("title") or "").removeprefix("Live hören: ").strip()
+    start = parse_iso(meta.get("broadcastedOnDateTime") or live.get("availFromDateTime"))
+    kickoff = parse_kickoff(meta.get("synopsis") or "")
+    return {
+        "title": title,
+        "slot": slot_m.group(1) if slot_m else None,
+        "hls": hls,
+        "mp3": mp3,
+        "page": page,
+        "start": start.isoformat() if start else None,
+        "kickoff": kickoff.isoformat() if kickoff else None,
+        "dvr_seconds": live.get("dvrWindowSeconds"),
+        "geo_flag": mc.get("isGeoBlocked"),
+    }
 
 
 def in_live_window(stream: dict, now: dt.datetime | None = None) -> bool:
@@ -208,7 +225,7 @@ def hls_is_live(hls_url: str) -> bool:
     """Cheap check: master playlist answers with #EXTM3U. Never touches the MP3."""
     try:
         body, _ = fetch(hls_url, timeout=8, max_bytes=64 * 1024)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+    except Exception:  # URLError, OSError, http.client.IncompleteRead, BadStatusLine, ...
         return False
     return body.lstrip().startswith(b"#EXTM3U")
 
@@ -312,9 +329,12 @@ class Mpv:
             cmd += [f"--log-file={logfile}", "--msg-level=all=v,ipc=debug"]
         else:
             cmd.append("--really-quiet")
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=True)
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         start_new_session=True)
+        except FileNotFoundError:
+            raise MpvError("mpv not found on PATH; install it with `brew install mpv`") from None
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._connect():
@@ -996,9 +1016,11 @@ def run_player(args) -> int:
     except MpvError as e:
         log(f"[!] {e}")
         return 1
+    # Early exits must not quit an mpv another run left playing (after `d`).
+    reused_mpv = session.mpv.proc is None
     if not session.streams:
         log("[!] no streams found")
-        session.shutdown()
+        session.shutdown(keep_mpv=reused_mpv)
         return 1
 
     server = None
@@ -1012,13 +1034,13 @@ def run_player(args) -> int:
         probe.close()
         if busy:
             log(f"[!] port {args.serve} is already in use on this machine; pick another with --serve PORT")
-            session.shutdown()
+            session.shutdown(keep_mpv=reused_mpv)
             return 1
         try:
             server = make_server(session, "0.0.0.0", args.serve)
         except OSError as e:
             log(f"[!] cannot listen on port {args.serve}: {e}")
-            session.shutdown()
+            session.shutdown(keep_mpv=reused_mpv)
             return 1
         url = f"http://{lan_ip()}:{args.serve}/"
         threading.Thread(target=server.serve_forever, daemon=True).start()

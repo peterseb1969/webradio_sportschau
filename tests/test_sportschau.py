@@ -84,6 +84,19 @@ class ExtractPlayerPage(unittest.TestCase):
         self.assertEqual(ss.extract_streams('<div data-v="not json">'), [])
         self.assertEqual(ss.extract_streams('<div data-v="{&quot;mc&quot;:{}}">'), [])
 
+    def test_malformed_blob_skipped(self):
+        # a blob with an unexpected shape is dropped, the good ones survive
+        good = fixture("player-elversberg-bayern-2026-09-13.html")
+        bad = [{"streams": ["x"]}, {"streams": [{"media": [{"url": 5}]}]},
+               {"meta": "x", "streams": [{"media": [{"url": "https://h/a.m3u8"}]}]},
+               {"streams": [{"media": [{"url": "https://h/a.m3u8"}]}],
+                "pluginData": {"sharing@web": {"link": ["not", "a", "string"]}}}]
+        blobs = "".join('<div data-v="%s">' % json.dumps({"mc": mc}).replace('"', "&quot;")
+                        for mc in bad)
+        streams = ss.extract_streams(blobs + good, "src")
+        self.assertIn("liga1spiel9", [s["slot"] for s in streams])
+        self.assertIn("src", [s["page"] for s in streams])  # non-string link -> source URL
+
 
 class Parsing(unittest.TestCase):
     def test_parse_iso(self):
@@ -91,6 +104,7 @@ class Parsing(unittest.TestCase):
         self.assertEqual(ss.parse_iso("2026-09-13T13:15:00Z"), want)
         self.assertEqual(ss.parse_iso("2026-09-13T13:15:00+0000"), want)
         self.assertEqual(ss.parse_iso("2026-09-13T15:15:00+02:00"), want)
+        self.assertEqual(ss.parse_iso("2026-09-13T13:15:00"), want)  # no offset -> UTC
         self.assertIsNone(ss.parse_iso(None))
         self.assertIsNone(ss.parse_iso("nonsense"))
 
@@ -99,6 +113,8 @@ class Parsing(unittest.TestCase):
         self.assertEqual(k.astimezone(UTC), dt.datetime(2026, 9, 13, 13, 30, tzinfo=UTC))
         self.assertIsNone(ss.parse_kickoff("kein Datum"))
         self.assertIsNone(ss.parse_kickoff(None))
+        self.assertIsNone(ss.parse_kickoff("am 31.02.2026 um 15:30 Uhr"))
+        self.assertIsNone(ss.parse_kickoff("am 13.09.2026 um 24:00 Uhr"))
 
     def test_derive_player_url(self):
         base = "https://www.sportschau.de/fussball/bundesliga/"
@@ -123,12 +139,58 @@ class Timing(unittest.TestCase):
         self.assertTrue(ss.in_live_window(self.stream, self.at(15, 30)))   # start + 2 h 15
         self.assertFalse(ss.in_live_window(self.stream, self.at(15, 31)))
         self.assertFalse(ss.in_live_window({"start": None}, self.at(13, 0)))
+        self.assertTrue(ss.in_live_window({"start": "2026-09-13T13:15:00"}, self.at(13, 0)))
 
     def test_status(self):
         up = dict(self.stream, live=True)
         self.assertEqual(ss.status_of(up, self.at(12, 0)), "pre")
         self.assertEqual(ss.status_of(up, self.at(13, 15)), "live")
         self.assertEqual(ss.status_of(dict(self.stream, live=False), self.at(13, 30)), "")
+
+
+class PlaylistCheck(unittest.TestCase):
+    def test_any_fetch_error_means_not_live(self):
+        errors = (http.client.IncompleteRead(b"#EXT"), http.client.BadStatusLine("junk"),
+                  OSError("down"), ValueError("unknown url type"))
+        for err in errors:
+            with self.subTest(type(err).__name__), mock.patch.object(ss, "fetch", side_effect=err):
+                self.assertFalse(ss.hls_is_live("https://h/master.m3u8"))
+
+    def test_playlist_answer(self):
+        with mock.patch.object(ss, "fetch", return_value=(b"\n#EXTM3U\n", "")):
+            self.assertTrue(ss.hls_is_live("https://h/master.m3u8"))
+        with mock.patch.object(ss, "fetch", return_value=(b"<html>", "")):
+            self.assertFalse(ss.hls_is_live("https://h/master.m3u8"))
+
+
+class EarlyExitKeepsReusedMpv(unittest.TestCase):
+    """`--ui` after a detach reuses the running mpv; failing to start must not quit it."""
+
+    def run_player(self, started_mpv: bool):
+        def start(session, log):  # overview fetch came back empty
+            session.streams = []
+            session.mpv.proc = object() if started_mpv else None
+
+        args = mock.Mock(ui=False, serve=8790, no_verify=True)
+        with mock.patch.object(ss.Session, "start", start), \
+                mock.patch.object(ss.Session, "shutdown") as shutdown, \
+                mock.patch("sys.stderr"):
+            self.assertEqual(ss.run_player(args), 1)
+        return shutdown
+
+    def test_reused_mpv_kept(self):
+        self.run_player(started_mpv=False).assert_called_once_with(keep_mpv=True)
+
+    def test_own_mpv_quit(self):
+        self.run_player(started_mpv=True).assert_called_once_with(keep_mpv=False)
+
+
+class MpvMissing(unittest.TestCase):
+    def test_friendly_error(self):
+        mpv = ss.Mpv(socket_path="/nonexistent-dir/mpv.sock")
+        with mock.patch.object(ss.subprocess, "Popen", side_effect=FileNotFoundError("mpv")):
+            with self.assertRaisesRegex(ss.MpvError, "brew install mpv"):
+                mpv.ensure_running()
 
 
 class RefreshDoesNotHoldLock(unittest.TestCase):

@@ -15,8 +15,8 @@ public.
 - **Finder: DONE and verified live on 2026-09-13** (see Background). Do not
   redo it. `sportschau_stream.py` lists all streams, marks live ones, and
   prints an mpv command. `fixtures/` holds saved HTML from that day for
-  offline tests. `sportschau_stream.v1.py` is the old heuristic version,
-  kept for reference only.
+  offline tests. The old heuristic version (`sportschau_stream.v1.py`) was
+  removed on 2026-10-25; it is in the initial commit if ever needed.
 - **Controller + terminal UI: DONE 2026-09-13** (`Mpv` class, `run_ui()`,
   `--ui`), tested live against Leipzig–HSV. See NOTES.md for mpv findings.
 - **LAN UI: DONE 2026-09-13** (`--serve`, `Session` shared with the terminal
