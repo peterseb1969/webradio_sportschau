@@ -52,6 +52,7 @@ Stdlib only, no dependencies.
 import argparse
 import datetime as dt
 import html as htmllib
+import ipaddress
 import json
 import os
 import re
@@ -62,6 +63,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 OVERVIEW_URLS = [
@@ -509,9 +511,12 @@ class Session:
 
     # -- stream list
     def refresh(self) -> str:
+        # Network I/O stays outside the lock so playback controls and /status
+        # keep answering while the overview page and playlists are fetched.
+        streams = find_streams(verify=self.verify, log=lambda m: None)
         with self.lock:
             cur_page = self.streams[self.current]["page"] if self.current is not None else None
-            self.streams = find_streams(verify=self.verify, log=lambda m: None)
+            self.streams = streams
             self.current = next((i for i, s in enumerate(self.streams) if s["page"] == cur_page), None)
             return f"{len(self.streams)} streams, {sum(1 for s in self.streams if s['live'])} up"
 
@@ -800,9 +805,10 @@ function render(j){
   let d="behind live "+hms(st.behind_live)+" · rewind room "+hms(st.rewind_room)+" · vol "+Math.round(st.volume||0)+"%";
   if(st.offset!=null&&st.mark_pos==null)d+=" · sync −"+st.offset.toFixed(1)+"s";$("detail").textContent=d}
  const mk=$("mark");if(st.mark_pos!=null){mk.classList.add("armed");mk.textContent="● Marked "+hms(st.mark_pos)+" ("+Math.floor(st.mark_age)+"s) — tap when picture catches up"}else{mk.classList.remove("armed");mk.textContent="● Mark"}
- const ul=$("streams");ul.innerHTML="";
+ const ul=$("streams");ul.replaceChildren();
  (j.streams||[]).forEach((s,i)=>{const li=document.createElement("li");if(i===j.current)li.className="current";
-  li.innerHTML='<span class="tag '+(s.status||"")+'">'+(s.status==="live"?"LIVE":s.status==="pre"?"pre":"")+'</span><span class="when">'+s.when+'</span><span class="title">'+s.title+'</span>';
+  const span=(cls,text)=>{const e=document.createElement("span");e.className=cls;e.textContent=text;li.appendChild(e)};
+  span("tag "+(s.status||""),s.status==="live"?"LIVE":s.status==="pre"?"pre":"");span("when",s.when);span("title",s.title);
   li.onclick=()=>act("play",{i});ul.appendChild(li)});
 }
 async function poll(){try{const r=await fetch("/status");render(await r.json())}catch(e){}}
@@ -821,6 +827,31 @@ def lan_ip() -> str:
         return ip
     except OSError:
         return "127.0.0.1"
+
+
+def host_allowed(host_header: str | None) -> bool:
+    """The page is reached by IP, localhost or a .local name.  Any other Host
+    means a foreign web page whose hostname resolves to this machine (DNS
+    rebinding), so refuse it."""
+    host = urllib.parse.urlsplit("//" + (host_header or "")).hostname or ""
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def origin_allowed(origin: str | None, host_header: str | None) -> bool:
+    """Browsers send Origin on every POST; it must be our own page.  No Origin
+    (curl, scripts) is fine — the no-auth home-LAN model covers those."""
+    if origin is None:
+        return True
+    return urllib.parse.urlsplit(origin).netloc == (host_header or "")
+
+
+MAX_BODY = 64 * 1024
 
 
 def make_server(session: Session, host: str, port: int):
@@ -850,6 +881,8 @@ def make_server(session: Session, host: str, port: int):
             self.wfile.write(body)
 
         def do_GET(self):
+            if not host_allowed(self.headers.get("Host")):
+                return self._json({"error": "forbidden"}, 403)
             if self.path in ("/", "/index.html"):
                 body = WEB_PAGE.encode()
                 self.send_response(200)
@@ -863,10 +896,20 @@ def make_server(session: Session, host: str, port: int):
                 self._json({"error": "not found"}, 404)
 
         def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
+            host_header = self.headers.get("Host")
+            if not (host_allowed(host_header) and origin_allowed(self.headers.get("Origin"), host_header)):
+                return self._json({"error": "forbidden"}, 403)
             try:
-                params = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
+                n = -1
+            if not 0 <= n <= MAX_BODY:
+                return self._json({"error": "bad Content-Length"}, 400)
+            try:
+                params = json.loads(self.rfile.read(n)) if n else {}
+            except ValueError:
+                params = {}
+            if not isinstance(params, dict):
                 params = {}
             name = self.path.lstrip("/")
             try:
@@ -892,7 +935,7 @@ def make_server(session: Session, host: str, port: int):
                     msg = session.next(int(params.get("step", 1)))
                 else:
                     return self._json({"error": "unknown action"}, 404)
-            except (MpvError, ValueError) as e:
+            except (MpvError, ValueError, TypeError) as e:
                 msg = f"error: {e}"
             self._json(snapshot(msg))
 

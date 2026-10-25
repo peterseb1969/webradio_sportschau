@@ -10,6 +10,14 @@ See the docstring in `sportschau_stream.py` and the Background section of the
 brief. Everything comes from one overview page; the player config is embedded
 as JSON in `data-v` attributes. Fixtures in `fixtures/`.
 
+Correction to the brief: single-match broadcasts start 15 min before kickoff,
+but the Konferenz starts 20 min before (seen in the overview fixture). The
+live window is computed from the broadcast start, so nothing depends on it.
+
+### Tests
+`python3 -m unittest -v` from the repo root. Offline only: the finder against
+`fixtures/`, timing/status logic, and the web server's request guards.
+
 ### mpv over JSON IPC
 - Command used to start mpv:
   `mpv --idle=yes --terminal=no --really-quiet --input-ipc-server=/tmp/sportschau-mpv.sock <MPV_FLAGS>`
