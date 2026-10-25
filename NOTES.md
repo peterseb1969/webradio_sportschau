@@ -41,9 +41,11 @@ live window is computed from the broadcast start, so nothing depends on it.
 
 ### Mark / sync (m, M)
 `m` stores the current audio position; a second `m` seeks back to it and
-records the wall-clock gap as the picture delay (shown as `sync -N s`).
-Any seek, pause, stream switch or stop between the presses drops the mark.
-`M` clears mark and sync. The seek checks mpv's `demuxer-cache-state`
+adds the audio played since the mark to the picture delay (shown as
+`sync -N s`). Repeated rounds add up (playback always did; the shown value
+used to be replaced by the last round, fixed 2026-10-25). Seeks adjust the
+value; live edge, stream switch, stop and `M` clear it.
+Any seek, pause, stream switch or stop between the presses drops the mark. The seek checks mpv's `demuxer-cache-state`
 seekable ranges first and refuses if the mark has left the buffer.
 
 ### LAN web UI (`--serve [PORT]`, default 8790)

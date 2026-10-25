@@ -428,17 +428,24 @@ class Mpv:
 
     LIVE_MARGIN = 1.5  # seconds kept back from the buffered end to avoid EOF
 
-    def seek(self, seconds: float) -> None:
+    def seek(self, seconds: float) -> float:
         """Relative seek; forward seeks are clamped so we never run past the
-        live edge (which makes mpv hit EOF and stop the stream)."""
-        if seconds > 0:
-            pos = self.get("time-pos")
+        live edge (which makes mpv hit EOF and stop the stream), backward
+        seeks to the start of the buffer.  Returns the seconds moved."""
+        pos = self.get("time-pos")
+        if pos is not None and seconds > 0:
             end = self.get("demuxer-cache-time")
-            if pos is not None and end is not None:
+            if end is not None:
                 seconds = min(seconds, max(0.0, end - self.LIVE_MARGIN - pos))
-                if seconds <= 0:
-                    return
+        elif pos is not None and seconds < 0:
+            ranges = (self.get("demuxer-cache-state") or {}).get("seekable-ranges") or []
+            start = min((r["start"] for r in ranges), default=None)
+            if start is not None:
+                seconds = max(seconds, min(0.0, start - pos))
+        if seconds == 0:
+            return 0.0
         self.send(["seek", seconds, "relative", "exact"])
+        return seconds
 
     def seek_to(self, position: float) -> bool:
         """Absolute exact seek. Returns False if the position is no longer
@@ -512,7 +519,7 @@ class Session:
         self.streams: list[dict] = []
         self.current: int | None = None
         self.mark: tuple[float, float] | None = None   # (audio position, wall clock) of 1st press
-        self.offset: float | None = None               # measured audio-ahead-of-picture delay
+        self.offset: float | None = None               # total delay added by sync + seeks since
         self.mpv = Mpv()
 
     def start(self, log=lambda m: None) -> None:
@@ -546,6 +553,7 @@ class Session:
                 return "no such stream"
             s = self.streams[index]
             self._drop_mark("stream changed")
+            self.offset = None  # new stream starts at the live edge
             self.current = index
             self._guard()
             self.mpv.play(s["hls"] or s["mp3"], s["title"])
@@ -573,7 +581,9 @@ class Session:
         with self.lock:
             msg = self._drop_mark("position changed before 2nd press")
             self._guard()
-            self.mpv.seek(seconds)
+            moved = self.mpv.seek(seconds)
+            if self.offset is not None:  # fine-tuning the sync
+                self.offset = max(0.0, self.offset - moved)
             return msg
 
     def seek_live(self) -> str:
@@ -581,6 +591,9 @@ class Session:
             msg = self._drop_mark("position changed before 2nd press")
             self._guard()
             self.mpv.seek_live()
+            if self.offset is not None:
+                self.offset = None
+                msg = msg or "back at live, sync cleared"
             return msg
 
     def volume(self, delta: float) -> str:
@@ -592,6 +605,7 @@ class Session:
     def stop(self) -> str:
         with self.lock:
             self._drop_mark("stopped")
+            self.offset = None
             self.current = None
             self._guard()
             self.mpv.stop()
@@ -609,12 +623,18 @@ class Session:
                     return "no position yet"
                 self.mark = (pos, time.monotonic())
                 return f"marked {_hms(pos)} — press again when the picture shows it"
-            measured = time.monotonic() - self.mark[1]
             target = self.mark[0]
+            # How far the audio moves back: what played since the mark (wall
+            # clock as fallback; it overcounts if mpv stalled in between).
+            added = (pos - target) if pos is not None else time.monotonic() - self.mark[1]
             self.mark = None
             if self.mpv.seek_to(target):
-                self.offset = measured
-                return f"synced: audio now {measured:.1f}s behind — fine-tune with ±1s / ±5s"
+                # Each round adds to the delay already set (m m, then m m again
+                # to correct the remaining gap).
+                prev = self.offset
+                self.offset = (prev or 0.0) + added
+                step = f"+{added:.1f}s, " if prev is not None else ""
+                return f"synced: {step}audio now {self.offset:.1f}s behind — fine-tune with ±1s / ±5s"
             return f"mark {_hms(target)} is no longer buffered; mark again"
 
     def clear_mark(self) -> str:
@@ -680,8 +700,8 @@ def _read_key(timeout: float) -> str | None:
 SEEK_KEYS = {",": -1, ".": 1, "<": -5, ">": 5, "LEFT": -10, "RIGHT": 10,
              "[": -60, "]": 60, "{": -300, "}": 300}
 
-HELP = ("[1-9]+Enter play   space pause   seek: ,/. ±1s  </> ±5s  ←/→ ±10s  [/] ±1m  {/} ±5m   "
-        "l live edge   m mark/sync   M clear   ↑/↓ volume   n/p next/prev   r refresh   s stop   d detach   q quit")
+HELP = ("[1-9]+Enter play   space pause   seek: ,/. ±1s  </> ±5s  ←/→ ±10s  [/] ±1m  {/} ±5m   l live edge",
+        "m mark/sync (repeat to add)   M clear   ↑/↓ volume   n/p next/prev   r refresh   s stop   d detach   q quit")
 
 
 def run_ui(session: Session, banner: str = "") -> bool:
@@ -701,7 +721,8 @@ def run_ui(session: Session, banner: str = "") -> bool:
             out.append(f"{cur}{i:2d}. [{tag}] {fmt_local(s['kickoff'] or s['start'])}  {s['title']}")
         out.append("")
         out.append(session.status_line(st))
-        out.append(flash or HELP)
+        out.append(flash)
+        out.extend(HELP)
         if typed:
             out.append(f"> {typed}")
         sys.stdout.write("\r\n".join(out) + "\r\n")

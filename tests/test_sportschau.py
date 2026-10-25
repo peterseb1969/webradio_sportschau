@@ -193,6 +193,71 @@ class MpvMissing(unittest.TestCase):
                 mpv.ensure_running()
 
 
+class FakeMpv:
+    """Just enough of Mpv for the sync logic: a position on a buffered timeline."""
+
+    def __init__(self, pos=1000.0):
+        self.pos = pos
+
+    def _connect(self):
+        return True
+
+    def get(self, prop, default=None):
+        return self.pos if prop == "time-pos" else default
+
+    def seek_to(self, position):
+        self.pos = position
+        return True
+
+    def seek(self, seconds):
+        self.pos += seconds
+        return seconds
+
+    def seek_live(self):
+        pass
+
+
+class MarkSync(unittest.TestCase):
+    def setUp(self):
+        self.session = ss.Session(verify=False)
+        self.session.mpv = self.mpv = FakeMpv()
+        self.session.current = 0
+
+    def mark_and_sync(self, gap):
+        """m, audio plays on for `gap` seconds, m."""
+        self.session.mark_or_sync()
+        self.mpv.pos += gap
+        return self.session.mark_or_sync()
+
+    def test_repeated_sync_adds_up(self):
+        start = self.mpv.pos
+        self.assertIn("now 30.0s behind", self.mark_and_sync(30))
+        self.mpv.pos += 60  # a minute later the user notices audio is still ahead
+        second_mark = self.mpv.pos
+        self.assertIn("+4.0s, audio now 34.0s behind", self.mark_and_sync(4))
+        self.assertEqual(self.session.offset, 34.0)
+        # back at the 2nd mark, not the 1st, and 34 s behind where the audio
+        # would be without syncing (30 + 60 + 4 s played)
+        self.assertEqual(self.mpv.pos, second_mark)
+        self.assertNotEqual(self.mpv.pos, start)
+        self.assertEqual(start + 30 + 60 + 4 - self.mpv.pos, 34.0)
+
+    def test_fine_tune_adjusts_offset(self):
+        self.mark_and_sync(30)
+        self.session.seek(-1)
+        self.session.seek(5)
+        self.assertEqual(self.session.offset, 26.0)
+
+    def test_live_and_stop_clear_sync(self):
+        self.mark_and_sync(30)
+        self.assertIn("sync cleared", self.session.seek_live())
+        self.assertIsNone(self.session.offset)
+        self.mark_and_sync(30)
+        with mock.patch.object(FakeMpv, "stop", create=True):
+            self.session.stop()
+        self.assertIsNone(self.session.offset)
+
+
 class RefreshDoesNotHoldLock(unittest.TestCase):
     def test_lock_free_during_fetch(self):
         session = ss.Session(verify=False)
