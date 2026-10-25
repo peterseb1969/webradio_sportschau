@@ -194,16 +194,24 @@ class MpvMissing(unittest.TestCase):
 
 
 class FakeMpv:
-    """Just enough of Mpv for the sync logic: a position on a buffered timeline."""
+    """Just enough of Mpv for the session logic: a position on a buffered timeline."""
 
-    def __init__(self, pos=1000.0):
+    def __init__(self, pos=1000.0, path=None, title=None):
         self.pos = pos
+        self.props = {"time-pos": pos, "path": path, "media-title": title, "idle-active": path is None}
+        self.played = []
 
     def _connect(self):
         return True
 
     def get(self, prop, default=None):
-        return self.pos if prop == "time-pos" else default
+        if prop == "time-pos":
+            return self.pos
+        value = self.props.get(prop)
+        return default if value is None else value
+
+    def play(self, url, title=""):
+        self.played.append(url)
 
     def seek_to(self, position):
         self.pos = position
@@ -258,6 +266,81 @@ class MarkSync(unittest.TestCase):
         self.assertIsNone(self.session.offset)
 
 
+def stream(page, start, live=False):
+    return {"page": page, "start": start, "live": live, "hls": f"https://h/{page}/master.m3u8",
+            "mp3": None, "title": page, "status": "live" if live else "", "kickoff": None}
+
+
+class Views(unittest.TestCase):
+    now = dt.datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
+    streams = [stream("live", "2026-09-13T11:15:00+00:00", live=True),
+               stream("later", "2026-09-13T16:15:00+00:00"),
+               stream("over", "2026-09-13T07:00:00+00:00"),       # ended 09:15
+               stream("next-week", "2026-09-20T13:15:00+00:00")]
+
+    def test_views(self):
+        vis = lambda view, cur=None: ss.visible_indices(self.streams, view, cur, self.now)  # noqa: E731
+        self.assertEqual(vis("live"), [0])
+        self.assertEqual(vis("today"), [0, 1])
+        self.assertEqual(vis("all"), [0, 1, 2, 3])
+        self.assertEqual(vis("live", cur=3), [0, 3])  # the playing stream always shows
+
+    def test_play_row_uses_on_screen_numbers(self):
+        session = ss.Session(verify=False, view="all")
+        session.mpv = mpv = FakeMpv()
+        session.streams = [dict(s) for s in self.streams]
+        with mock.patch.object(ss, "visible_indices", lambda st, v, c: [1, 3]):
+            self.assertTrue(session.play_row(2).startswith("next-week: feed not up yet"))
+            self.assertEqual(session.play_row(3), "no such stream")
+        self.assertEqual(session.current, 3)
+        self.assertEqual(mpv.played, [self.streams[3]["hls"]])
+
+
+class NextPrev(unittest.TestCase):
+    def test_cycles_live_streams_only(self):
+        session = ss.Session(verify=False)
+        session.mpv = FakeMpv()
+        session.streams = [stream("a", None, live=True), stream("b", None), stream("c", None, live=True)]
+        session.current = 0
+        session.next(1)
+        self.assertEqual(session.current, 2)
+        session.next(1)
+        self.assertEqual(session.current, 0)
+        session.next(-1)
+        self.assertEqual(session.current, 2)
+        session.streams[0]["live"] = False
+        self.assertEqual(session.next(1), "no other live stream")
+
+
+class Reattach(unittest.TestCase):
+    def setUp(self):
+        self.session = ss.Session(verify=False)
+        self.session.streams = [stream("a", None, live=True), stream("b", None, live=True)]
+
+    def test_finds_playing_stream(self):
+        self.session.mpv = FakeMpv(path=self.session.streams[1]["hls"], title="B")
+        self.session._adopt_playing()
+        self.assertEqual(self.session.current, 1)
+
+    def test_unknown_stream_adopted(self):
+        self.session.mpv = FakeMpv(path="https://h/old/master.m3u8", title="Last week")
+        self.session._adopt_playing()
+        self.assertEqual(self.session.streams[self.session.current]["title"], "Last week")
+        self.assertEqual(len(self.session.streams), 3)
+
+    def test_idle_mpv_left_alone(self):
+        self.session.mpv = FakeMpv()
+        self.session._adopt_playing()
+        self.assertIsNone(self.session.current)
+
+    def test_refresh_keeps_stream_that_left_the_overview(self):
+        self.session.current = 1
+        with mock.patch.object(ss, "find_streams", lambda **kw: [stream("c", None, live=True)]):
+            self.session.refresh()
+        self.assertEqual([s["page"] for s in self.session.streams], ["c", "b"])
+        self.assertEqual(self.session.current, 1)
+
+
 class RefreshDoesNotHoldLock(unittest.TestCase):
     def test_lock_free_during_fetch(self):
         session = ss.Session(verify=False)
@@ -282,6 +365,9 @@ class RefreshDoesNotHoldLock(unittest.TestCase):
 class StubSession:
     current = None
     streams = []
+
+    def view(self, view=None):
+        return self.streams, [], self.current
 
     def status(self):
         return {"idle": True}

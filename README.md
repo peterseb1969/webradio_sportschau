@@ -41,20 +41,33 @@ is already up before the broadcast (often music, well before kickoff).
 
 | Key | Action |
 | --- | --- |
-| `1`–`9` … `Enter` | play stream number |
+| `1`–`9` … `Enter` | play the stream with that number on screen |
 | `space` | pause / resume |
 | `,` `.` / `<` `>` / `←` `→` / `[` `]` / `{` `}` | seek ±1 s / ±5 s / ±10 s / ±1 min / ±5 min |
 | `l` | jump to the live edge |
 | `m` | mark / sync (see below) |
 | `M` | clear mark and sync |
 | `↑` `↓` | volume |
-| `n` `p` | next / previous stream |
-| `r` | refresh the stream list |
+| `n` `p` | next / previous stream whose feed is up |
+| `Tab` | show / hide the stream list |
+| `a` | show all streams / only the relevant ones |
+| `r` | refresh the stream list now |
 | `s` | stop |
 | `d` | detach: quit the UI, keep mpv playing (run `--ui` again to reattach) |
 | `q` | quit and stop mpv |
 
 If exactly one stream is live at start, the UI plays it right away.
+
+**Stream list.** By default the player lists only streams whose feed is up
+plus today's broadcasts that aren't over yet; finished matches and other
+matchdays are hidden (`a` shows them). With `--live` it starts with only the
+streams that are up. While something plays, the list collapses to one line
+with the current match; `Tab` opens it, stopping opens it too. The list
+refreshes itself every 2½ minutes, so `pre` turns into `LIVE` on its own.
+
+**Reattach.** After `d`, running `--ui` (or `--serve`) again picks up the
+stream mpv is playing, with its rewind buffer intact. The sync value is not
+carried over; the audio delay itself is, since mpv keeps its position.
 
 ### Syncing the radio to the TV picture
 
@@ -73,7 +86,8 @@ live (`l`), switching streams, stopping or `M` resets the sync.
 ### Phone remote (`--serve`)
 
 `--serve [PORT]` (default 8790) starts a small web page with the same
-controls: play, pause, seek, live, mark/sync, volume and the stream list. It
+controls: play, pause, seek, live, mark/sync, volume and the stream list
+(collapsed while playing, tap the bar to open it; "all" shows every stream). It
 listens on all interfaces, so open `http://<your-mac-ip>:8790/` on your
 phone. The address is printed at startup.
 

@@ -37,7 +37,14 @@ live window is computed from the broadcast start, so nothing depends on it.
   start playback at kickoff (brief task 5: auto-start).
 - A second client can attach to the running mpv via the socket; `--ui` reuses
   an existing mpv instead of starting another. `d` in the UI detaches and
-  leaves mpv playing.
+  leaves mpv playing. On reattach `Session._adopt_playing()` matches mpv's
+  `path` property against the stream URLs (verified live 2026-10-25: `path`
+  is the master URL as passed to `loadfile`); unknown URLs get a stub record.
+- Stream list views (2026-10-25): `today` (default: feed up, or broadcast
+  later today and not over), `live` (`--live`), `all` (`a`). Row numbers are
+  per view and resolved under the session lock (`play_row`), because the
+  background refresh (every 150 s) can replace the list at any time. A
+  stream that drops off the overview while playing is kept in the list.
 
 ### Mark / sync (m, M)
 `m` stores the current audio position; a second `m` seeks back to it and

@@ -221,6 +221,35 @@ def status_of(stream: dict, now: dt.datetime | None = None) -> str:
     return "live" if (start is None or now >= start) else "pre"
 
 
+VIEWS = ("today", "live", "all")
+
+
+def visible_indices(streams: list[dict], view: str, current: int | None = None,
+                    now: dt.datetime | None = None) -> list[int]:
+    """Indices of the streams a view lists; the current stream always.
+    'live': feed up (live or pre); 'today': that plus broadcasts later
+    today that are not over yet; 'all': everything."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    today = now.astimezone().date()
+
+    def keep(s):
+        if view == "all" or s.get("live"):
+            return True
+        if view == "live":
+            return False
+        start = parse_iso(s.get("start"))
+        return bool(start) and now <= start + LIVE_AFTER_START and start.astimezone().date() == today
+    return [i for i, s in enumerate(streams) if i == current or keep(s)]
+
+
+def adopted_record(path: str, title: str | None) -> dict:
+    """Stream record for something mpv is already playing that is not in
+    the fetched list (e.g. last matchday's stream after a reattach)."""
+    return {"title": title or path, "slot": None, "hls": path, "mp3": None, "page": path,
+            "start": None, "kickoff": None, "dvr_seconds": None, "geo_flag": None,
+            "scheduled_live": False, "live": True, "status": "live"}
+
+
 def hls_is_live(hls_url: str) -> bool:
     """Cheap check: master playlist answers with #EXTM3U. Never touches the MP3."""
     try:
@@ -512,10 +541,11 @@ class Session:
     All public methods are serialised with a lock (mpv's socket is not
     thread-safe) and return a short human-readable message."""
 
-    def __init__(self, verify: bool = True):
+    def __init__(self, verify: bool = True, view: str = "today"):
         import threading
         self.lock = threading.RLock()
         self.verify = verify
+        self.default_view = view
         self.streams: list[dict] = []
         self.current: int | None = None
         self.mark: tuple[float, float] | None = None   # (audio position, wall clock) of 1st press
@@ -525,6 +555,20 @@ class Session:
     def start(self, log=lambda m: None) -> None:
         self.streams = find_streams(verify=self.verify, log=log)
         self.mpv.ensure_running()
+        self._adopt_playing()
+
+    def _adopt_playing(self) -> None:
+        """Reattached to an mpv that is already playing (after `d`): pick up
+        what it plays instead of showing "stopped" and restarting it."""
+        if self.mpv.get("idle-active", True):
+            return
+        path = self.mpv.get("path")
+        if not path:
+            return
+        self.current = next((i for i, s in enumerate(self.streams) if path in (s["hls"], s["mp3"])), None)
+        if self.current is None:
+            self.streams.append(adopted_record(path, self.mpv.get("media-title")))
+            self.current = len(self.streams) - 1
 
     def _drop_mark(self, why: str) -> str:
         if self.mark is not None:
@@ -542,10 +586,20 @@ class Session:
         # keep answering while the overview page and playlists are fetched.
         streams = find_streams(verify=self.verify, log=lambda m: None)
         with self.lock:
-            cur_page = self.streams[self.current]["page"] if self.current is not None else None
+            cur = self.streams[self.current] if self.current is not None else None
             self.streams = streams
-            self.current = next((i for i, s in enumerate(self.streams) if s["page"] == cur_page), None)
+            self.current = next((i for i, s in enumerate(streams) if cur and s["page"] == cur["page"]), None)
+            if cur and self.current is None:  # gone from the overview while playing: keep it
+                streams.append(cur)
+                self.current = len(streams) - 1
             return f"{len(self.streams)} streams, {sum(1 for s in self.streams if s['live'])} up"
+
+    def view(self, view: str | None = None) -> tuple[list[dict], list[int], int | None]:
+        """Consistent (streams, visible indices, current) snapshot; the list
+        may be replaced by a background refresh at any time."""
+        with self.lock:
+            return (self.streams, visible_indices(self.streams, view or self.default_view, self.current),
+                    self.current)
 
     def play(self, index: int) -> str:
         with self.lock:
@@ -561,11 +615,23 @@ class Session:
                 return f"{s['title']}: feed not up yet (kickoff {fmt_local(s['kickoff'])}) — trying anyway"
             return f"playing {s['title']}"
 
-    def next(self, step: int = 1) -> str:
+    def play_row(self, row: int, view: str | None = None) -> str:
+        """Play the row-th (1-based) stream of a view, as numbered on screen."""
         with self.lock:
-            if self.current is None or not self.streams:
+            _, rows, _ = self.view(view)
+            if not 1 <= row <= len(rows):
+                return "no such stream"
+            return self.play(rows[row - 1])
+
+    def next(self, step: int = 1) -> str:
+        """Next/previous stream whose feed is up."""
+        with self.lock:
+            if self.current is None:
                 return "nothing playing"
-            return self.play((self.current + step) % len(self.streams))
+            ring = [i for i, s in enumerate(self.streams) if s["live"] or i == self.current]
+            if len(ring) < 2:
+                return "no other live stream"
+            return self.play(ring[(ring.index(self.current) + step) % len(ring)])
 
     # -- transport
     def toggle_pause(self) -> str:
@@ -692,6 +758,8 @@ def _read_key(timeout: float) -> str | None:
         return {b"[A": "UP", b"[B": "DOWN", b"[C": "RIGHT", b"[D": "LEFT"}.get(seq, "ESC")
     if ch in (b"\r", b"\n"):
         return "ENTER"
+    if ch == b"\t":
+        return "TAB"
     if ch == b"\x03":
         return "CTRL_C"
     return ch.decode("utf-8", errors="replace")
@@ -701,7 +769,8 @@ SEEK_KEYS = {",": -1, ".": 1, "<": -5, ">": 5, "LEFT": -10, "RIGHT": 10,
              "[": -60, "]": 60, "{": -300, "}": 300}
 
 HELP = ("[1-9]+Enter play   space pause   seek: ,/. ±1s  </> ±5s  ←/→ ±10s  [/] ±1m  {/} ±5m   l live edge",
-        "m mark/sync (repeat to add)   M clear   ↑/↓ volume   n/p next/prev   r refresh   s stop   d detach   q quit")
+        "m mark/sync (repeat adds)  M clear  ↑/↓ vol  n/p next/prev live  Tab list  a all  "
+        "r refresh  s stop  d detach  q quit")
 
 
 def run_ui(session: Session, banner: str = "") -> bool:
@@ -711,14 +780,33 @@ def run_ui(session: Session, banner: str = "") -> bool:
     typed = ""
     flash = ""
     keep_mpv = False
+    view = session.default_view          # 'a' toggles "all"
+    list_open = True                     # collapsed while something plays; Tab toggles
 
     def draw():
         st = session.status()
+        streams, rows, cur = session.view(view)
         out = ["\x1b[H\x1b[J", "Sportschau Bundesliga audio" + (f"   {banner}" if banner else "") + "\n"]
-        for i, s in enumerate(session.streams, 1):
-            tag = {"live": "LIVE", "pre": "pre "}.get(s["status"], "    ")
-            cur = ">" if i - 1 == session.current else " "
-            out.append(f"{cur}{i:2d}. [{tag}] {fmt_local(s['kickoff'] or s['start'])}  {s['title']}")
+        if list_open:
+            for n, i in enumerate(rows, 1):
+                s = streams[i]
+                tag = {"live": "LIVE", "pre": "pre "}.get(s["status"], "    ")
+                out.append(f"{'>' if i == cur else ' '}{n:2d}. [{tag}] "
+                           f"{fmt_local(s['kickoff'] or s['start'])}  {s['title']}")
+            hidden = len(streams) - len(rows)
+            if not rows:
+                out.append(f"    no streams {'up right now' if view == 'live' else 'today'}"
+                           f" — a: show all {len(streams)}")
+            elif hidden:
+                out.append(f"    … {hidden} more — a: show all")
+        elif cur is not None:
+            s = streams[cur]
+            others = sum(1 for i, x in enumerate(streams) if x["live"] and i != cur)
+            tag = {"live": "LIVE", "pre": "pre"}.get(s["status"], "")
+            more = f"{others} more live · " if others else ""
+            out.append(f"▶ {s['title']}   {tag}   {more}Tab: list")
+        else:
+            out.append(f"  {len(rows)} stream(s) · Tab: list")
         out.append("")
         out.append(session.status_line(st))
         out.append(flash)
@@ -733,8 +821,9 @@ def run_ui(session: Session, banner: str = "") -> bool:
     try:
         tty.setraw(fd)
         live = [i for i, s in enumerate(session.streams) if s["status"] == "live"]
-        if len(live) == 1 and session.current is None:
+        if len(live) == 1 and session.current is None and session.mpv.get("idle-active", True):
             flash = session.play(live[0])
+        list_open = session.current is None
         last_draw = 0.0
         while True:
             now = time.monotonic()
@@ -753,10 +842,17 @@ def run_ui(session: Session, banner: str = "") -> bool:
                     break
                 elif key.isdigit():
                     typed += key
+                    list_open = True  # show the numbers being typed against
                     continue
                 elif key == "ENTER" and typed:
                     n, typed = int(typed), ""
-                    flash = session.play(n - 1)
+                    flash = session.play_row(n, view)
+                    list_open = session.current is None or flash == "no such stream"
+                elif key == "TAB":
+                    list_open = not list_open
+                elif key == "a":
+                    view = "all" if view != "all" else session.default_view
+                    list_open = True
                 elif key == "ESC":
                     typed = ""
                 elif key == " ":
@@ -779,6 +875,7 @@ def run_ui(session: Session, banner: str = "") -> bool:
                     flash = session.next(-1)
                 elif key == "s":
                     flash = session.stop()
+                    list_open = True
                 elif key == "r":
                     flash = "refreshing…"
                     draw()
@@ -812,7 +909,11 @@ WEB_PAGE = r"""<!doctype html><html lang="de"><head><meta charset="utf-8">
  button.mark.armed{background:#c63;animation:pulse 1s infinite alternate}
  @keyframes pulse{from{opacity:1}to{opacity:.6}}
  button.danger{background:#522}
- #streams{list-style:none;padding:0;margin:12px 0 0}
+ #listbar{display:flex;gap:8px;align-items:center;margin-top:12px;padding:12px 10px;background:#1c1c1c;border-radius:10px;cursor:pointer}
+ #listbar .sum{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ #listbar button{flex:0 0 auto;padding:6px 10px;font-size:14px}
+ #streams{list-style:none;padding:0;margin:4px 0 0}
+ #more{color:#777;font-size:14px;padding:8px}
  #streams li{display:flex;align-items:center;gap:8px;padding:10px 8px;border-bottom:1px solid #222;cursor:pointer}
  #streams li.current{background:#1a2a3a}
  #streams .tag{font-size:12px;width:34px;text-align:center;border-radius:6px;padding:2px 0;color:#000;background:#333}
@@ -830,12 +931,14 @@ WEB_PAGE = r"""<!doctype html><html lang="de"><head><meta charset="utf-8">
 <div class="row"><button onclick="act('seek',{s:300})">+5m</button><button onclick="act('seek',{s:60})">+1m</button><button onclick="act('seek',{s:10})">+10s</button><button onclick="act('seek',{s:5})">+5s</button><button onclick="act('seek',{s:1})">+1s</button></div>
 <div class="row"><button class="mark" id="mark" onclick="act('mark')">● Mark</button><button onclick="act('clear')" style="flex:.4">✕</button></div>
 <div class="row"><button onclick="act('volume',{d:-5})">🔉 −</button><button onclick="act('volume',{d:5})">🔊 +</button><button onclick="act('refresh')">↻ List</button></div>
-<ul id="streams"></ul>
+<div id="listbar" onclick="toggleList()"><span class="sum" id="listsum"></span><button id="allbtn" onclick="event.stopPropagation();showAll=!showAll;poll()"></button></div>
+<ul id="streams"></ul><div id="more"></div>
 <small>Controls the mpv on the host machine. Home LAN only, no auth.</small>
 <script>
 const $=id=>document.getElementById(id);
 const hms=s=>{if(s==null)return"--:--";s=Math.floor(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return(h?h+":"+String(m).padStart(2,"0"):String(m).padStart(2,"0"))+":"+String(x).padStart(2,"0")};
-let flashTimer;
+let flashTimer,listOpen=null,showAll=false,lastPage,last={};
+function toggleList(){listOpen=!listOpen;render(last)}
 function flash(t){$("flash").textContent=t||"";clearTimeout(flashTimer);if(t)flashTimer=setTimeout(()=>$("flash").textContent="",6000)}
 async function act(name,params){try{const r=await fetch("/"+name,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(params||{})});const j=await r.json();if(j.message)flash(j.message);render(j)}catch(e){flash("request failed: "+e)}}
 function render(j){
@@ -846,8 +949,17 @@ function render(j){
   let d="behind live "+hms(st.behind_live)+" · rewind room "+hms(st.rewind_room)+" · vol "+Math.round(st.volume||0)+"%";
   if(st.offset!=null&&st.mark_pos==null)d+=" · sync −"+st.offset.toFixed(1)+"s";$("detail").textContent=d}
  const mk=$("mark");if(st.mark_pos!=null){mk.classList.add("armed");mk.textContent="● Marked "+hms(st.mark_pos)+" ("+Math.floor(st.mark_age)+"s) — tap when picture catches up"}else{mk.classList.remove("armed");mk.textContent="● Mark"}
- const ul=$("streams");ul.replaceChildren();
- (j.streams||[]).forEach((s,i)=>{const li=document.createElement("li");if(i===j.current)li.className="current";
+ last=j;
+ // the list collapses when playback starts or changes, opens on stop
+ const all=j.streams||[],cur=j.current!=null?all[j.current]:null,page=cur?cur.page:null;
+ if(page!==lastPage){listOpen=(page==null);lastPage=page}
+ const rows=showAll?all.map((_,i)=>i):(j.visible||[]),nlive=all.filter(s=>s.live).length;
+ $("listsum").textContent=(listOpen?"▾ ":"▸ ")+(cur&&!listOpen?"▶ "+cur.title+" · ":"Streams · ")+nlive+" live";
+ $("allbtn").textContent=showAll?"fewer":"all "+all.length;$("allbtn").hidden=!listOpen;
+ const ul=$("streams");ul.replaceChildren();ul.hidden=!listOpen;
+ $("more").textContent=listOpen&&!rows.length?"none in this view — tap “all”":"";
+ if(!listOpen)return;
+ rows.forEach(i=>{const s=all[i],li=document.createElement("li");if(i===j.current)li.className="current";
   const span=(cls,text)=>{const e=document.createElement("span");e.className=cls;e.textContent=text;li.appendChild(e)};
   span("tag "+(s.status||""),s.status==="live"?"LIVE":s.status==="pre"?"pre":"");span("when",s.when);span("title",s.title);
   li.onclick=()=>act("play",{i});ul.appendChild(li)});
@@ -893,19 +1005,22 @@ def origin_allowed(origin: str | None, host_header: str | None) -> bool:
 
 
 MAX_BODY = 64 * 1024
+AUTO_REFRESH_SECS = 150
 
 
 def make_server(session: Session, host: str, port: int):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     def snapshot(message: str = "") -> dict:
+        streams, rows, cur = session.view()
         return {
             "message": message,
             "status": session.status(),
-            "current": session.current,
-            "streams": [{"title": s["title"], "status": s["status"], "live": s["live"],
+            "current": cur,
+            "visible": rows,
+            "streams": [{"title": s["title"], "status": s["status"], "live": s["live"], "page": s["page"],
                          "when": fmt_local(s["kickoff"] or s["start"]), "slot": s["slot"]}
-                        for s in session.streams],
+                        for s in streams],
         }
 
     class Handler(BaseHTTPRequestHandler):
@@ -987,7 +1102,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Find ARD Sportschau Bundesliga audio streams")
     ap.add_argument("url", nargs="?", help="a sportschau.de audiostream match page (optional)")
     ap.add_argument("--live", action="store_true",
-                    help="only show streams whose feed is up now (live or pre-match)")
+                    help="only show streams whose feed is up now (live or pre-match); "
+                         "with --ui/--serve the starting view, 'a' shows all")
     ap.add_argument("--json", action="store_true", help="output JSON instead of a table")
     ap.add_argument("--mpv", action="store_true", help="print an mpv command for the first (live) stream")
     ap.add_argument("--mp3", action="store_true", help="with --mpv: use the Icecast MP3 instead of HLS")
@@ -1031,7 +1147,7 @@ def run_player(args) -> int:
     if args.ui and not sys.stdin.isatty():
         log("--ui needs an interactive terminal")
         return 2
-    session = Session(verify=not args.no_verify)
+    session = Session(verify=not args.no_verify, view="live" if args.live else "today")
     try:
         session.start(log=log)
     except MpvError as e:
@@ -1067,6 +1183,17 @@ def run_player(args) -> int:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         log(f"[*] LAN control page: {url}")
 
+    # Keep LIVE/pre current on a match day without pressing r.
+    stop_refresh = threading.Event()
+
+    def auto_refresh():
+        while not stop_refresh.wait(AUTO_REFRESH_SECS):
+            try:
+                session.refresh()
+            except Exception:  # never kill the thread; try again next round
+                pass
+    threading.Thread(target=auto_refresh, daemon=True).start()
+
     import signal
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     keep_mpv = False
@@ -1080,6 +1207,7 @@ def run_player(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        stop_refresh.set()
         if server:
             server.shutdown()
         session.shutdown(keep_mpv=keep_mpv)
