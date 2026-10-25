@@ -64,7 +64,10 @@ thread-safe). `--ui --serve` runs both front ends on the same session.
 - Port 8765 was taken by another local service; macOS lets `0.0.0.0:PORT`
   bind next to someone else's `127.0.0.1:PORT`, so the script probes the
   port first and refuses if busy.
-- SIGTERM is handled like Ctrl-C (mpv is stopped, socket removed).
+- SIGTERM and SIGHUP (terminal window closed) are handled like Ctrl-C / `q`
+  (mpv is stopped, socket removed); `d` is the only way to leave mpv playing.
+- A socket file is only deleted when nobody accepts on it; a live mpv that
+  does not answer gives an error instead of being orphaned by a second one.
 - **One mpv per socket.** Every instance shares `/tmp/sportschau-mpv.sock`;
   quitting one instance with `q` stops that mpv for the others too (they
   recover by starting a new one, but playback is interrupted). Set

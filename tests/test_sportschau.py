@@ -5,7 +5,10 @@ import datetime as dt
 import http.client
 import json
 import os
+import shlex
+import socket
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -98,6 +101,23 @@ class ExtractPlayerPage(unittest.TestCase):
         self.assertIn("src", [s["page"] for s in streams])  # non-string link -> source URL
 
 
+class StreamUrls(unittest.TestCase):
+    def test_only_https_reaches_mpv(self):
+        def blob(url):
+            mc = {"streams": [{"media": [{"url": url}]}], "pluginData": {"sharing@web": {"link": url}}}
+            return '<div data-v="%s">' % json.dumps({"mc": mc}).replace('"', "&quot;")
+        bad = ["file:///etc/passwd.m3u8", "http://h/a.m3u8", "lavfi://sine.mp3", "ytdl://x.m3u8"]
+        self.assertEqual(ss.extract_streams("".join(blob(u) for u in bad)), [])
+        self.assertEqual(len(ss.extract_streams(blob("https://h/a.m3u8"))), 1)
+
+    def test_mpv_command_is_shell_safe(self):
+        title = 'A "gegen" B $(touch /tmp/pwned) `id`'
+        cmd = ss.mpv_command({"title": title, "hls": "https://h/a.m3u8?x=1&y=2", "mp3": None})
+        args = shlex.split(cmd)
+        self.assertIn(f"--force-media-title={title}", args)
+        self.assertEqual(args[-1], "https://h/a.m3u8?x=1&y=2")
+
+
 class Parsing(unittest.TestCase):
     def test_parse_iso(self):
         want = dt.datetime(2026, 9, 13, 13, 15, tzinfo=UTC)
@@ -183,6 +203,52 @@ class EarlyExitKeepsReusedMpv(unittest.TestCase):
 
     def test_own_mpv_quit(self):
         self.run_player(started_mpv=True).assert_called_once_with(keep_mpv=False)
+
+
+class StaleSocket(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="sps", dir="/tmp")  # short: macOS caps socket paths
+        self.path = os.path.join(self.dir, "mpv.sock")
+
+    def tearDown(self):
+        for name in os.listdir(self.dir):
+            os.unlink(os.path.join(self.dir, name))
+        os.rmdir(self.dir)
+
+    def test_stale_socket_replaced(self):
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        dead.bind(self.path)  # file exists, nobody listens
+        dead.close()
+        mpv = ss.Mpv(socket_path=self.path)
+        with mock.patch.object(ss.subprocess, "Popen", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(ss.MpvError, "not found"):
+                mpv.ensure_running()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_live_but_silent_mpv_not_orphaned(self):
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        live.bind(self.path)
+        live.listen(8)  # connections queue up, nobody answers (macOS refuses once the queue is full)
+        try:
+            mpv = ss.Mpv(socket_path=self.path)
+            with mock.patch.object(ss.Mpv, "IPC_TIMEOUT", 0.2), \
+                    mock.patch.object(ss.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(ss.MpvError, "not answering"):
+                    mpv.ensure_running()
+            popen.assert_not_called()
+            self.assertTrue(os.path.exists(self.path))
+        finally:
+            live.close()
+
+
+class PortArg(unittest.TestCase):
+    def test_port_number(self):
+        self.assertEqual(ss.port_number("8790"), 8790)
+        for bad in ("0", "70000", "-1"):
+            with self.assertRaises(ss.argparse.ArgumentTypeError):
+                ss.port_number(bad)
+        with self.assertRaises(ValueError):
+            ss.port_number("abc")
 
 
 class MpvMissing(unittest.TestCase):
@@ -431,7 +497,7 @@ class WebServer(unittest.TestCase):
                 self.assertEqual(code, 400)
 
     def test_bad_params(self):
-        for body in ('{"i": [1]}', '{"i": "x"}', "[1, 2]", "not json"):
+        for body in ('{"i": [1]}', '{"i": "x"}', '{"i": Infinity}', "[1, 2]", "not json"):
             with self.subTest(body):
                 code, resp = self.request("POST", "/play", body)
                 self.assertEqual(code, 200)

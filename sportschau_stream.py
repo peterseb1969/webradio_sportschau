@@ -176,8 +176,10 @@ def extract_streams(raw_html: str, source_url: str = "") -> list[dict]:
 def _stream_record(mc: dict, source_url: str) -> dict | None:
     """One player config's `mc` -> stream record, or None if it has no stream."""
     meta = mc.get("meta") or {}
-    urls = [m.get("url") for s in mc.get("streams") or []
-            for m in s.get("media") or [] if m.get("url")]
+    # Only https: these URLs go straight to mpv, which also opens local
+    # files and special protocols (lavfi://, ytdl://, ...).
+    urls = [u for s in mc.get("streams") or [] for m in s.get("media") or []
+            if isinstance(u := m.get("url"), str) and u.startswith("https://")]
     hls = next((u for u in urls if ".m3u8" in u), None)
     mp3 = next((u for u in urls if "icecast" in u or ".mp3" in u), None)
     if not (hls or mp3):
@@ -318,7 +320,7 @@ def print_table(streams: list[dict]) -> None:
 
 def mpv_command(stream: dict, prefer_mp3: bool = False) -> str:
     url = (stream["mp3"] if prefer_mp3 else stream["hls"]) or stream["hls"] or stream["mp3"]
-    return f'mpv {MPV_FLAGS} --force-media-title="{stream["title"]}" "{url}"'
+    return f"mpv {MPV_FLAGS} --force-media-title={shlex.quote(stream['title'])} {shlex.quote(url)}"
 
 
 # ---------------------------------------------------------------- mpv control
@@ -345,11 +347,17 @@ class Mpv:
         self._rid = 0
         self._edge: tuple[float, float] | None = None  # (newest buffered end, wall clock when seen)
 
+    IPC_TIMEOUT = 3.0
+
     # -- lifecycle
     def ensure_running(self, timeout: float = 8.0) -> "Mpv":
         if self._connect():
             return self
         if os.path.exists(self.path):
+            if self._listening():
+                # Deleting the socket of a live mpv would orphan it: it keeps
+                # playing and nothing can reach it any more.
+                raise MpvError(f"mpv at {self.path} is not answering; try again, or `pkill mpv`")
             os.unlink(self.path)  # stale socket from a dead mpv
         cmd = ["mpv", "--idle=yes", "--terminal=no",
                f"--input-ipc-server={self.path}"] + shlex.split(self.flags)
@@ -373,12 +381,26 @@ class Mpv:
             time.sleep(0.1)
         raise MpvError(f"mpv did not open {self.path} within {timeout}s")
 
+    def _listening(self) -> bool:
+        """Does a process accept on the socket (vs. a file left by a dead mpv)?"""
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        try:
+            probe.connect(self.path)
+            return True
+        except (ConnectionRefusedError, FileNotFoundError):
+            return False
+        except OSError:  # busy, timed out, ...: assume someone is there
+            return True
+        finally:
+            probe.close()
+
     def _connect(self) -> bool:
         if self.sock:
             return True
         try:
             c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c.settimeout(3.0)
+            c.settimeout(self.IPC_TIMEOUT)
             c.connect(self.path)
         except OSError:
             return False
@@ -751,7 +773,12 @@ def _read_key(timeout: float) -> str | None:
     r, _, _ = select.select([sys.stdin], [], [], timeout)
     if not r:
         return None
-    ch = os.read(sys.stdin.fileno(), 1)
+    try:
+        ch = os.read(sys.stdin.fileno(), 1)
+    except OSError:  # terminal hung up
+        return "EOF"
+    if not ch:
+        return "EOF"
     if ch == b"\x1b":
         r, _, _ = select.select([sys.stdin], [], [], 0.05)
         seq = os.read(sys.stdin.fileno(), 2) if r else b""
@@ -835,7 +862,7 @@ def run_ui(session: Session, banner: str = "") -> bool:
                 continue
             last_draw = 0.0  # redraw after every key
             try:
-                if key in ("q", "CTRL_C"):
+                if key in ("q", "CTRL_C", "EOF"):
                     break
                 elif key == "d":
                     keep_mpv = True
@@ -883,8 +910,12 @@ def run_ui(session: Session, banner: str = "") -> bool:
             except MpvError as e:
                 flash = f"mpv: {e}"
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        sys.stdout.write("\x1b[H\x1b[J")
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            sys.stdout.write("\x1b[H\x1b[J")
+            sys.stdout.flush()
+        except (termios.error, OSError):  # terminal window already closed
+            pass
     return keep_mpv
 
 
@@ -1091,11 +1122,18 @@ def make_server(session: Session, host: str, port: int):
                     msg = session.next(int(params.get("step", 1)))
                 else:
                     return self._json({"error": "unknown action"}, 404)
-            except (MpvError, ValueError, TypeError) as e:
+            except Exception as e:  # bad params (e.g. Infinity), mpv errors, bugs: report, don't drop
                 msg = f"error: {e}"
             self._json(snapshot(msg))
 
     return ThreadingHTTPServer((host, port), Handler)
+
+
+def port_number(value: str) -> int:
+    n = int(value)
+    if not 1 <= n <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be 1-65535, not {n}")
+    return n
 
 
 def main() -> int:
@@ -1109,7 +1147,7 @@ def main() -> int:
     ap.add_argument("--mp3", action="store_true", help="with --mpv: use the Icecast MP3 instead of HLS")
     ap.add_argument("--no-verify", action="store_true", help="skip checking the CDN, use the schedule only")
     ap.add_argument("--ui", action="store_true", help="interactive terminal player (controls mpv over IPC)")
-    ap.add_argument("--serve", nargs="?", const=8790, type=int, metavar="PORT",
+    ap.add_argument("--serve", nargs="?", const=8790, type=port_number, metavar="PORT",
                     help="LAN web UI on PORT (default 8790); combine with --ui to have both")
     ap.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)  # legacy alias for the list
     args = ap.parse_args()
@@ -1195,7 +1233,10 @@ def run_player(args) -> int:
     threading.Thread(target=auto_refresh, daemon=True).start()
 
     import signal
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+    # SIGTERM and closing the terminal window (SIGHUP) act like q; `d` is the
+    # explicit way to leave mpv playing.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     keep_mpv = False
     try:
         if args.ui:
@@ -1211,11 +1252,14 @@ def run_player(args) -> int:
         if server:
             server.shutdown()
         session.shutdown(keep_mpv=keep_mpv)
-        if keep_mpv:
-            print(f"mpv keeps playing in the background (socket {session.mpv.path}); "
-                  f"run --ui again to reattach.")
-        else:
-            print("mpv stopped.")
+        try:
+            if keep_mpv:
+                print(f"mpv keeps playing in the background (socket {session.mpv.path}); "
+                      f"run --ui again to reattach.")
+            else:
+                print("mpv stopped.")
+        except OSError:  # terminal gone; don't fail again flushing at exit
+            sys.stdout = open(os.devnull, "w")
     return 0
 
 

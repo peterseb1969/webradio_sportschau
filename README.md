@@ -54,7 +54,7 @@ is already up before the broadcast (often music, well before kickoff).
 | `r` | refresh the stream list now |
 | `s` | stop |
 | `d` | detach: quit the UI, keep mpv playing (run `--ui` again to reattach) |
-| `q` | quit and stop mpv |
+| `q` | quit and stop mpv (closing the terminal window does the same) |
 
 If exactly one stream is live at start, the UI plays it right away.
 
